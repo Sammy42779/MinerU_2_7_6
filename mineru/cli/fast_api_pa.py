@@ -8,6 +8,7 @@ Server A — 纯 GPU 解析引擎
 import asyncio
 import base64
 import glob
+import io
 import os
 import sys
 import time
@@ -69,6 +70,65 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+
+# ============================================================
+# 启动预热 — 提前加载 VLM 模型到 GPU 显存
+# ============================================================
+@app.on_event("startup")
+async def warmup_model():
+    """在服务启动时用一个最小空白 PDF 驱动 VLM 推理，
+    触发 ModelSingleton 加载模型权重到 VRAM，
+    避免第一个真实请求承受 30-120 秒的模型加载延迟。
+    设置 MINERU_SKIP_WARMUP=1 可跳过。
+    """
+    if os.getenv("MINERU_SKIP_WARMUP", "0") == "1":
+        logger.info("[warmup] skipped (MINERU_SKIP_WARMUP=1)")
+        return
+
+    logger.info("[warmup] starting model warmup ...")
+    t0 = time.time()
+
+    try:
+        # ---- 生成 1 页空白 PDF (pypdfium2) ----
+        import pypdfium2 as pdfium
+
+        pdf_doc = pdfium.PdfDocument.new()
+        pdf_doc.new_page(width=612, height=792)          # Letter size
+        buf = io.BytesIO()
+        pdf_doc.save(buf)
+        pdf_doc.close()
+        warmup_pdf_bytes = buf.getvalue()
+
+        # ---- 准备临时目录 ----
+        work_dir = os.path.join(tempfile.gettempdir(), "mineru_warmup")
+        os.makedirs(work_dir, exist_ok=True)
+
+        try:
+            local_image_dir, _ = prepare_env(work_dir, "warmup", "vlm")
+            image_writer = FileBasedDataWriter(local_image_dir)
+
+            backend = os.getenv("MINERU_VLM_BACKEND", "vllm-async-engine")
+            if backend == "auto-engine":
+                backend = get_vlm_engine(inference_engine="auto", is_async=True)
+
+            # ---- 执行推理，触发模型加载 ----
+            os.environ.setdefault("MINERU_VLM_FORMULA_ENABLE", "True")
+            os.environ.setdefault("MINERU_VLM_TABLE_ENABLE", "True")
+
+            await aio_vlm_doc_analyze(
+                warmup_pdf_bytes, image_writer=image_writer, backend=backend
+            )
+
+            elapsed = round(time.time() - t0, 2)
+            logger.info(f"[warmup] model loaded and ready  ({elapsed}s)")
+        finally:
+            _cleanup(work_dir)
+
+    except Exception as e:
+        elapsed = round(time.time() - t0, 2)
+        logger.error(f"[warmup] failed after {elapsed}s: {e}")
+        logger.info("[warmup] model will load on first request instead")
 
 
 # ============================================================
@@ -191,6 +251,7 @@ async def dialog(req: DialogRequest):
             # ---------- VLM 推理 ----------
             os.environ["MINERU_VLM_FORMULA_ENABLE"] = os.getenv("MINERU_VLM_FORMULA_ENABLE", "True")
             os.environ["MINERU_VLM_TABLE_ENABLE"] = os.getenv("MINERU_VLM_TABLE_ENABLE", "True")
+            # os.environ["MINERU_TABLE_MERGE_ENABLE"] = False
 
             middle_json, _infer_result = await aio_vlm_doc_analyze(
                 pdf_bytes, image_writer=image_writer, backend=backend
@@ -249,7 +310,8 @@ async def dialog(req: DialogRequest):
 # ============================================================
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": __version__}
+    # return {"status": "ok", "version": __version__}
+    return True
 
 
 # ============================================================
